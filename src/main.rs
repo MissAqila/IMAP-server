@@ -20,9 +20,11 @@ use dotenv::dotenv;
 
 /// Supabase config holder
 #[derive(Clone)]
-struct SupabaseConfig {
+struct Config {
     url: String,
     key: String,
+    use_bans: bool,
+    use_domains: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,13 +33,13 @@ struct SupabaseUser {
     email: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, sqlx::FromRow)]
 struct Inbox {
     email_address: String,
     user_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, sqlx::FromRow)]
 struct Domain {
     domain: String,
     user_id: String,
@@ -55,19 +57,23 @@ struct ImapToken {
 /// Cache structure for domains
 #[derive(Clone)]
 struct DomainsCache {
+    pool: PgPool,
+    config: Config,
     domains: Arc<Mutex<Vec<Domain>>>,
     last_updated: Arc<Mutex<SystemTime>>,
 }
 
 impl DomainsCache {
-    fn new() -> Self {
+    fn new(pool: PgPool, config: Config) -> Self {
         Self {
+            pool,
+            config,
             domains: Arc::new(Mutex::new(Vec::new())),
             last_updated: Arc::new(Mutex::new(SystemTime::UNIX_EPOCH)),
         }
     }
 
-    async fn get_domains(&self, supabase: &SupabaseConfig) -> Result<Vec<Domain>> {
+    async fn get_domains(&self) -> Result<Vec<Domain>> {
         let mut domains_guard = self.domains.lock().await;
         let mut last_updated_guard = self.last_updated.lock().await;
 
@@ -75,7 +81,7 @@ impl DomainsCache {
         {
             info!("🔄 Domains cache is stale, refreshing...");
 
-            match fetch_all_domains(supabase).await {
+            match fetch_all_domains(&self.config, &self.pool).await {
                 Ok(new_domains) => {
                     *domains_guard = new_domains;
                     *last_updated_guard = SystemTime::now();
@@ -97,27 +103,55 @@ impl DomainsCache {
     }
 }
 
-/// Check Supabase for an active email ban (scope=email)
-async fn is_email_banned_supabase(supabase: &SupabaseConfig, email: &str) -> bool {
-    let client = reqwest::Client::new();
-    let url = format!("{}/rest/v1/bans?scope=eq.email&value=eq.{}&status=eq.active", supabase.url, email);
-    match client
-        .get(&url)
-        .header("apikey", &supabase.key)
-        .header("Authorization", format!("Bearer {}", supabase.key))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                match resp.json::<Vec<serde_json::Value>>().await {
-                    Ok(rows) => return !rows.is_empty(),
-                    Err(_) => return false,
+/// Check for an active email ban
+async fn is_email_banned(config: &Config, pool: &PgPool, email: &str) -> bool {
+    if config.use_bans {
+        let client = reqwest::Client::new();
+        let url = format!("{}/rest/v1/bans?scope=eq.email&value=eq.{}&status=eq.active", config.url, email);
+        match client
+            .get(&url)
+            .header("apikey", &config.key)
+            .header("Authorization", format!("Bearer {}", config.key))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<Vec<serde_json::Value>>().await {
+                        Ok(rows) => return !rows.is_empty(),
+                        Err(_) => return false,
+                    }
                 }
+                false
             }
-            false
+            Err(_) => false,
         }
-        Err(_) => false,
+    } else {
+        // Local PostgreSQL
+        let result: Result<Vec<(String, String)>, _> = sqlx::query_as(
+            "SELECT value, match_type FROM bans WHERE status = 'active' AND scope = 'email'",
+        )
+        .fetch_all(pool)
+        .await;
+        match result {
+            Ok(bans) => {
+                let email_lower = email.to_lowercase();
+                for (value, match_type) in bans {
+                    let v_lower = value.to_lowercase();
+                    if match_type == "contains" {
+                        if email_lower.contains(&v_lower) {
+                            return true;
+                        }
+                    } else {
+                        if email_lower == v_lower {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -134,11 +168,13 @@ async fn main() -> Result<()> {
         .parse()
         .context("IMAP_BIND must be in format IP:PORT (e.g., 0.0.0.0:143)")?;
 
-    let supabase_config = SupabaseConfig {
+    let supabase_config = Config {
         url: std::env::var("SUPABASE_URL").context("SUPABASE_URL environment variable is required")?,
         key: std::env::var("SUPABASE_SERVICE_KEY")
             .or_else(|_| std::env::var("SUPABASE_KEY"))
             .context("SUPABASE_SERVICE_KEY or SUPABASE_KEY environment variable is required")?,
+        use_bans: std::env::var("USE_SUPABASE_BANS").unwrap_or_else(|_| "true".to_string()) == "true",
+        use_domains: std::env::var("USE_SUPABASE_DOMAINS").unwrap_or_else(|_| "true".to_string()) == "true",
     };
 
     let database_url = std::env::var("DATABASE_URL")?;
@@ -151,7 +187,7 @@ async fn main() -> Result<()> {
 
     let global_state = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
 
-    let domains_cache = DomainsCache::new();
+    let domains_cache = DomainsCache::new(pool.clone(), supabase_config.clone());
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -163,7 +199,7 @@ async fn main() -> Result<()> {
         info!("New connection from {}", addr);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, addr, pool, supabase_config, global_state, domains_cache).await {
+            if let Err(e) = handle_conn(stream, addr, pool, supabase_config.clone(), global_state, domains_cache).await {
                 error!("connection error from {}: {:?}", addr, e);
             }
         });
@@ -174,7 +210,7 @@ async fn handle_conn(
     stream: TcpStream,
     addr: SocketAddr,
     pool: PgPool,
-    supabase: SupabaseConfig,
+    config: Config,
     _global_state: Arc<Mutex<HashMap<String, u64>>>,
     domains_cache: DomainsCache,
 ) -> Result<()> {
@@ -288,7 +324,7 @@ async fn handle_conn(
                 let pass = login_args[1].to_string();
 
                 info!(%peer, user=%user, "attempting login");
-                match verify_user_supabase(&supabase, &user, &pass).await {
+                match verify_user(&config, &user, &pass).await {
                     Ok((user_id_result, user_email)) => {
                         authenticated_user = Some(user_email.clone());
                         user_id = Some(user_id_result);
@@ -311,7 +347,7 @@ async fn handle_conn(
                 info!("🔍 Fetching inboxes for user_id: {}", user_id.as_ref().unwrap());
 
                 // Get ONLY the user's inboxes from Supabase
-                let inboxes = get_user_inboxes_supabase(&supabase, user_id.as_ref().unwrap()).await;
+                let inboxes = get_user_inboxes(&config, &pool, user_id.as_ref().unwrap()).await;
                 match inboxes {
                     Ok(user_inboxes) => {
                         info!("📧 Found {} inboxes for user", user_inboxes.len());
@@ -353,7 +389,7 @@ async fn handle_conn(
                 info!(%peer, mailbox=%mailbox_name, "attempting to select mailbox");
 
                 // Deny selection if the mailbox address is explicitly banned
-                if is_email_banned_supabase(&supabase, &mailbox_name).await {
+                if is_email_banned(&config, &pool, &mailbox_name).await {
                     w.write_all("NO Mailbox is banned\r\n".as_bytes()).await?;
                     continue;
                 }
@@ -392,7 +428,7 @@ async fn handle_conn(
                 let emails = get_emails_for_mailbox(&pool, mailbox).await.unwrap_or_default();
 
                 // Fetch active sender/email bans once and reuse for filtering
-                let sender_bans = match fetch_active_sender_bans(&supabase).await {
+                let sender_bans = match fetch_active_sender_bans(&config, &pool).await {
                     Ok(b) => b,
                     Err(e) => {
                         error!(%e, "Failed to fetch sender bans from Supabase, proceeding without bans");
@@ -508,7 +544,7 @@ async fn handle_conn(
                 let emails = get_emails_for_mailbox(&pool, mailbox).await.unwrap_or_default();
 
                 // Fetch active sender/email bans once and reuse for filtering
-                let sender_bans = match fetch_active_sender_bans(&supabase).await {
+                let sender_bans = match fetch_active_sender_bans(&config, &pool).await {
                     Ok(b) => b,
                     Err(e) => {
                         error!(%e, "Failed to fetch sender bans from Supabase, proceeding without bans");
@@ -611,21 +647,21 @@ async fn handle_conn(
                 info!(%peer, email=%new_inbox, domain=%domain, "validating domain");
 
                 // Deny creation if the domain is actively banned (global domain ban)
-                if is_domain_banned_supabase(&supabase, &domain).await {
+                if is_domain_banned(&config, &pool, &domain).await {
                     w.write_all("NO Domain is banned\r\n".as_bytes()).await?;
                     continue;
                 }
 
                 // Deny creation if the mailbox address itself is explicitly banned (scope=email)
-                if is_email_banned_supabase(&supabase, &new_inbox).await {
+                if is_email_banned(&config, &pool, &new_inbox).await {
                     w.write_all("NO Mailbox is banned\r\n".as_bytes()).await?;
                     continue;
                 }
 
-                match validate_domain_cached(&domains_cache, &supabase, &domain, user_id.as_ref().unwrap()).await {
+                match validate_domain_cached(&domains_cache, &domain, user_id.as_ref().unwrap()).await {
                     Ok(true) => {
-                        // Create inbox in Supabase
-                        match create_inbox_supabase(&supabase, user_id.as_ref().unwrap(), &new_inbox).await {
+                        // Create inbox in PostgreSQL
+                        match create_inbox(&config, &pool, user_id.as_ref().unwrap(), &new_inbox).await {
                             Ok(_) => {
                                 w.write_all("OK CREATE completed\r\n".as_bytes()).await?;
                                 info!(%peer, mailbox=%new_inbox, "mailbox created in Supabase");
@@ -661,10 +697,10 @@ async fn handle_conn(
                     continue;
                 }
 
-                match delete_inbox_supabase(&supabase, user_id.as_ref().unwrap(), &mailbox_to_delete).await {
+                match delete_inbox(&config, &pool, user_id.as_ref().unwrap(), &mailbox_to_delete).await {
                     Ok(_) => {
                         w.write_all("OK DELETE completed\r\n".as_bytes()).await?;
-                        info!(%peer, mailbox=%mailbox_to_delete, "mailbox deleted from Supabase");
+                        info!(%peer, mailbox=%mailbox_to_delete, "mailbox deleted from PostgreSQL");
                     }
                     Err(e) => {
                         w.write_all(format!("NO DELETE failed: {}\r\n", e).as_bytes()).await?;
@@ -688,69 +724,126 @@ async fn handle_conn(
     }
 }
 
-/// Check Supabase for an active domain ban (scope=domain)
-async fn is_domain_banned_supabase(supabase: &SupabaseConfig, domain: &str) -> bool {
-    let client = reqwest::Client::new();
-    let url = format!("{}/rest/v1/bans?scope=eq.domain&value=eq.{}&status=eq.active", supabase.url, domain);
-    match client
-        .get(&url)
-        .header("apikey", &supabase.key)
-        .header("Authorization", format!("Bearer {}", supabase.key))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                match resp.json::<Vec<serde_json::Value>>().await {
-                    Ok(rows) => return !rows.is_empty(),
-                    Err(_) => return false,
+/// Check for an active domain ban
+async fn is_domain_banned(config: &Config, pool: &PgPool, domain: &str) -> bool {
+    if config.use_bans {
+        let client = reqwest::Client::new();
+        let url = format!("{}/rest/v1/bans?scope=eq.domain&value=eq.{}&status=eq.active", config.url, domain);
+        match client
+            .get(&url)
+            .header("apikey", &config.key)
+            .header("Authorization", format!("Bearer {}", config.key))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<Vec<serde_json::Value>>().await {
+                        Ok(rows) => return !rows.is_empty(),
+                        Err(_) => return false,
+                    }
                 }
+                false
             }
-            false
+            Err(_) => false,
         }
-        Err(_) => false,
+    } else {
+        // Local PostgreSQL
+        let result: Result<Vec<(String, String)>, _> = sqlx::query_as(
+            "SELECT value, match_type FROM bans WHERE status = 'active' AND scope = 'domain'",
+        )
+        .fetch_all(pool)
+        .await;
+        match result {
+            Ok(bans) => {
+                let domain_lower = domain.to_lowercase();
+                for (value, match_type) in bans {
+                    let v_lower = value.to_lowercase();
+                    if match_type == "contains" {
+                        if domain_lower.contains(&v_lower) {
+                            return true;
+                        }
+                    } else {
+                        if domain_lower == v_lower {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
     }
 }
 
-/// Fetch active sender/email bans from Supabase and normalize values
-async fn fetch_active_sender_bans(supabase: &SupabaseConfig) -> Result<Vec<(String, String)>> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/rest/v1/bans?status=eq.active&or=(scope.eq.sender,scope.eq.email)", supabase.url);
+/// Fetch active sender/email bans
+async fn fetch_active_sender_bans(config: &Config, pool: &PgPool) -> Result<Vec<(String, String)>> {
+    if config.use_bans {
+        let client = reqwest::Client::new();
+        let url = format!("{}/rest/v1/bans?status=eq.active&or=(scope.eq.sender,scope.eq.email)", config.url);
 
-    let resp = client
-        .get(&url)
-        .header("apikey", &supabase.key)
-        .header("Authorization", format!("Bearer {}", supabase.key))
-        .send()
-        .await
-        .context("Failed to fetch sender bans from Supabase")?;
+        let resp = client
+            .get(&url)
+            .header("apikey", &config.key)
+            .header("Authorization", format!("Bearer {}", config.key))
+            .send()
+            .await
+            .context("Failed to fetch sender bans from Supabase")?;
 
-    if !resp.status().is_success() {
-        anyhow::bail!("Supabase returned status {} when fetching bans", resp.status());
-    }
-
-    let rows: Vec<JsonValue> = resp.json().await.context("Failed to parse bans JSON")?;
-    let mut out = Vec::new();
-
-    for row in rows {
-        let mut value = row.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let mut match_type = row.get("match_type").and_then(|m| m.as_str()).unwrap_or("").to_string();
-
-        // legacy support: value like "contains:foo" -> normalize
-        if value.to_lowercase().starts_with("contains:") {
-            value = value["contains:".len()..].to_string();
-            match_type = "contains".to_string();
+        if !resp.status().is_success() {
+            anyhow::bail!("Supabase returned status {} when fetching bans", resp.status());
         }
 
-        // default match_type to exact if not specified
-        if match_type.is_empty() {
-            match_type = "exact".to_string();
+        let rows: Vec<JsonValue> = resp.json().await.context("Failed to parse bans JSON")?;
+        let mut out = Vec::new();
+
+        for row in rows {
+            let mut value = row.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let mut match_type = row.get("match_type").and_then(|m| m.as_str()).unwrap_or("").to_string();
+
+            // legacy support: value like "contains:foo" -> normalize
+            if value.to_lowercase().starts_with("contains:") {
+                value = value["contains:".len()..].to_string();
+                match_type = "contains".to_string();
+            }
+
+            // default match_type to exact if not specified
+            if match_type.is_empty() {
+                match_type = "exact".to_string();
+            }
+
+            out.push((value, match_type));
         }
 
-        out.push((value, match_type));
+        Ok(out)
+    } else {
+        // Local PostgreSQL
+        let result: Result<Vec<(String, String, String)>, _> = sqlx::query_as(
+            "SELECT value, match_type, scope FROM bans WHERE status = 'active' AND (scope = 'sender' OR scope = 'email')",
+        )
+        .fetch_all(pool)
+        .await;
+        match result {
+            Ok(rows) => {
+                let mut out = Vec::new();
+                for (value, match_type, _) in rows {
+                    let mut v = value;
+                    let mut mt = match_type;
+                    // legacy
+                    if v.to_lowercase().starts_with("contains:") {
+                        v = v["contains:".len()..].to_string();
+                        mt = "contains".to_string();
+                    }
+                    if mt.is_empty() {
+                        mt = "exact".to_string();
+                    }
+                    out.push((v, mt));
+                }
+                Ok(out)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
-
-    Ok(out)
 }
 
 /// Check if a sender is banned by evaluating list of (value, match_type)
@@ -918,58 +1011,32 @@ async fn get_emails_for_mailbox(pool: &PgPool, mailbox: &str) -> Result<Vec<Emai
     Ok(emails)
 }
 
-/// Get ONLY user's inboxes from Supabase
-async fn get_user_inboxes_supabase(supabase: &SupabaseConfig, user_id: &str) -> Result<Vec<Inbox>> {
-    let client = reqwest::Client::new();
-
-    let response = client
-        .get(&format!("{}/rest/v1/inbox?user_id=eq.{}", supabase.url, user_id))
-        .header("apikey", &supabase.key)
-        .header("Authorization", format!("Bearer {}", supabase.key))
-        .header("Content-Type", "application/json")
-        .send()
-        .await
-        .context("Failed to query user inboxes from Supabase")?;
-
-    if response.status().is_success() {
-        let response_text = response.text().await.context("Failed to get response text")?;
-        debug!("Supabase user inboxes response: {}", response_text);
-
-        match serde_json::from_str::<Vec<Inbox>>(&response_text) {
-            Ok(inboxes) => {
-                info!("✅ Successfully fetched {} inboxes for user {} from Supabase", inboxes.len(), user_id);
-
-                for inbox in &inboxes {
-                    debug!("📧 Inbox: {} (user_id: {:?})", inbox.email_address, inbox.user_id);
-                }
-
-                Ok(inboxes)
-            }
-            Err(e) => {
-                error!("❌ Failed to parse user inboxes JSON: {}", e);
-                error!("❌ Response body that failed to parse: {}", response_text);
-                Ok(Vec::new())
-            }
-        }
-    } else {
-        error!("❌ Failed to get user inboxes from Supabase: {}", response.status());
-        Ok(Vec::new())
-    }
+/// Get ONLY user's inboxes
+async fn get_user_inboxes(config: &Config, pool: &PgPool, user_id: &str) -> Result<Vec<Inbox>> {
+    // Always use local PostgreSQL
+    let inboxes: Vec<Inbox> = sqlx::query_as(
+        "SELECT email_address, user_id FROM inbox WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    info!("✅ Successfully fetched {} inboxes for user {} from PostgreSQL", inboxes.len(), user_id);
+    Ok(inboxes)
 }
 
 /// Verify using IMAP tokens with service role key
-async fn verify_user_supabase(supabase: &SupabaseConfig, user: &str, token: &str) -> Result<(String, String)> {
+async fn verify_user(config: &Config, user: &str, token: &str) -> Result<(String, String)> {
     let client = reqwest::Client::new();
 
     info!("🔍 Looking for token: {}", token);
 
-    let token_url = format!("{}/rest/v1/imap_tokens?token=eq.{}", supabase.url, token);
+    let token_url = format!("{}/rest/v1/imap_tokens?token=eq.{}", config.url, token);
     info!("📡 Token URL: {}", token_url);
 
     let token_response = client
         .get(&token_url)
-        .header("apikey", &supabase.key)
-        .header("Authorization", format!("Bearer {}", supabase.key))
+        .header("apikey", &config.key)
+        .header("Authorization", format!("Bearer {}", config.key))
         .header("Content-Type", "application/json")
         .send()
         .await
@@ -989,13 +1056,13 @@ async fn verify_user_supabase(supabase: &SupabaseConfig, user: &str, token: &str
             if token_data.expires_at > Utc::now() {
                 info!("✅ Token is not expired");
 
-                let user_url = format!("{}/auth/v1/admin/users/{}", supabase.url, token_data.user_id);
+                let user_url = format!("{}/auth/v1/admin/users/{}", config.url, token_data.user_id);
                 info!("📡 User URL: {}", user_url);
 
                 let user_response = client
                     .get(&user_url)
-                    .header("apikey", &supabase.key)
-                    .header("Authorization", format!("Bearer {}", supabase.key))
+                    .header("apikey", &config.key)
+                    .header("Authorization", format!("Bearer {}", config.key))
                     .send()
                     .await
                     .context("Failed to get user details")?;
@@ -1012,13 +1079,13 @@ async fn verify_user_supabase(supabase: &SupabaseConfig, user: &str, token: &str
                         info!("✅ Email matches: {} == {}", user_data.email, user);
 
                         // Check user's subscription status
-                        let user_details_url = format!("{}/rest/v1/users?id=eq.{}", supabase.url, user_data.id);
+                        let user_details_url = format!("{}/rest/v1/users?id=eq.{}", config.url, user_data.id);
                         info!("📡 User details URL: {}", user_details_url);
 
                         let user_details_response = client
                             .get(&user_details_url)
-                            .header("apikey", &supabase.key)
-                            .header("Authorization", format!("Bearer {}", supabase.key))
+                            .header("apikey", &config.key)
+                            .header("Authorization", format!("Bearer {}", config.key))
                             .send()
                             .await
                             .context("Failed to get user subscription details")?;
@@ -1069,9 +1136,9 @@ async fn verify_user_supabase(supabase: &SupabaseConfig, user: &str, token: &str
                         }
 
                         let _ = client
-                            .patch(&format!("{}/rest/v1/imap_tokens?id=eq.{}", supabase.url, token_data.id))
-                            .header("apikey", &supabase.key)
-                            .header("Authorization", format!("Bearer {}", supabase.key))
+                            .patch(&format!("{}/rest/v1/imap_tokens?id=eq.{}", config.url, token_data.id))
+                            .header("apikey", &config.key)
+                            .header("Authorization", format!("Bearer {}", config.key))
                             .header("Content-Type", "application/json")
                             .json(&serde_json::json!({
                                 "last_used_at": Utc::now().to_rfc3339()
@@ -1104,35 +1171,44 @@ async fn verify_user_supabase(supabase: &SupabaseConfig, user: &str, token: &str
     }
 }
 
-/// Fetch all domains from Supabase
-async fn fetch_all_domains(supabase: &SupabaseConfig) -> Result<Vec<Domain>> {
-    let client = reqwest::Client::new();
+/// Fetch all domains
+async fn fetch_all_domains(config: &Config, pool: &PgPool) -> Result<Vec<Domain>> {
+    if config.use_domains {
+        let client = reqwest::Client::new();
 
-    let response = client
-        .get(&format!("{}/rest/v1/domains", supabase.url))
-        .header("apikey", &supabase.key)
-        .header("Authorization", format!("Bearer {}", supabase.key))
-        .header("Content-Type", "application/json")
-        .send()
-        .await
-        .context("Failed to query domains")?;
+        let response = client
+            .get(&format!("{}/rest/v1/domains", config.url))
+            .header("apikey", &config.key)
+            .header("Authorization", format!("Bearer {}", config.key))
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .context("Failed to query domains")?;
 
-    if response.status().is_success() {
-        let domains: Vec<Domain> = response.json().await.context("Failed to parse domains response")?;
-        Ok(domains)
+        if response.status().is_success() {
+            let domains: Vec<Domain> = response.json().await.context("Failed to parse domains response")?;
+            Ok(domains)
+        } else {
+            anyhow::bail!("Failed to query domains: {}", response.status())
+        }
     } else {
-        anyhow::bail!("Failed to query domains: {}", response.status())
+        // Local PostgreSQL
+        let domains: Vec<Domain> = sqlx::query_as(
+            "SELECT domain, user_id, active, cloudflare_domain FROM domains",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(domains)
     }
 }
 
 /// Validate domain using cached data (supports subdomains)
 async fn validate_domain_cached(
     cache: &DomainsCache,
-    supabase: &SupabaseConfig,
     domain: &str,
     user_id: &str,
 ) -> Result<bool> {
-    let domains = cache.get_domains(supabase).await?;
+    let domains = cache.get_domains().await?;
 
     if let Some(domain_data) = domains.iter().find(|d| d.domain == domain) {
         info!(
@@ -1170,46 +1246,28 @@ async fn validate_domain_cached(
     Ok(false)
 }
 
-/// Create a new inbox for user in Supabase
-async fn create_inbox_supabase(supabase: &SupabaseConfig, user_id: &str, email_address: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(&format!("{}/rest/v1/inbox", supabase.url))
-        .header("apikey", &supabase.key)
-        .header("Authorization", format!("Bearer {}", supabase.key))
-        .header("Content-Type", "application/json")
-        .header("Prefer", "return=representation")
-        .json(&serde_json::json!({
-            "user_id": user_id,
-            "email_address": email_address
-        }))
-        .send()
-        .await
-        .context("Failed to create inbox")?;
-
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        anyhow::bail!("Failed to create inbox: {}", response.status())
-    }
+/// Create a new inbox for user
+async fn create_inbox(config: &Config, pool: &PgPool, user_id: &str, email_address: &str) -> Result<()> {
+    // Always use local PostgreSQL
+    sqlx::query(
+        "INSERT INTO inbox (user_id, email_address) VALUES ($1, $2)",
+    )
+    .bind(user_id)
+    .bind(email_address)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
-/// Delete an inbox for user from Supabase
-async fn delete_inbox_supabase(supabase: &SupabaseConfig, user_id: &str, email_address: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-
-    let response = client
-        .delete(&format!("{}/rest/v1/inbox?user_id=eq.{}&email_address=eq.{}", supabase.url, user_id, email_address))
-        .header("apikey", &supabase.key)
-        .header("Authorization", format!("Bearer {}", supabase.key))
-        .send()
-        .await
-        .context("Failed to delete inbox")?;
-
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        anyhow::bail!("Failed to delete inbox: {}", response.status())
-    }
+/// Delete an inbox for user
+async fn delete_inbox(config: &Config, pool: &PgPool, user_id: &str, email_address: &str) -> Result<()> {
+    // Always use local PostgreSQL
+    sqlx::query(
+        "DELETE FROM inbox WHERE user_id = $1 AND email_address = $2",
+    )
+    .bind(user_id)
+    .bind(email_address)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

@@ -57,6 +57,8 @@ This server is designed as a **secure IMAP retrieval server** that:
 
 ## 🏗️ Architecture
 
+## 🏗️ Architecture
+
 ```
 ┌─────────────────────┐
 │  IMAP Client        │
@@ -79,13 +81,14 @@ This server is designed as a **secure IMAP retrieval server** that:
            ▼              ▼              ▼
 ┌──────────────┐ ┌────────────────┐ ┌─────────────┐
 │  PostgreSQL  │ │   Supabase     │ │   Caching   │
-│  (Emails)    │ │  - Auth        │ │  (Domains)  │
-│              │ │  - Inboxes     │ │             │
-│              │ │  - Domains     │ │             │
-│              │ │  - Bans        │ │             │
-│              │ │  - Tokens      │ │             │
+│  (Emails,    │ │  - Auth        │ │  (Domains)  │
+│   Inboxes,   │ │  - Tokens      │ │             │
+│   Domains,   │ │  - Users       │ │             │
+│   Bans)      │ │                │ │             │
 └──────────────┘ └────────────────┘ └─────────────┘
 ```
+
+**Self-hosted mode**: When `USE_SUPABASE_BANS=false` and `USE_SUPABASE_DOMAINS=false`, PostgreSQL handles domains and bans locally. Inboxes are always stored in PostgreSQL.
 
 ---
 
@@ -102,7 +105,8 @@ This server is designed as a **secure IMAP retrieval server** that:
 - ✅ **Quoted-Printable**: Automatic decoding of encoded content
 - ✅ **Concurrent Connections**: Async Tokio runtime for multiple clients
 - ✅ **PostgreSQL Storage**: Reliable email retrieval with indexing
-- ✅ **Supabase Integration**: Auth, users, domains, inboxes, bans
+- ✅ **Supabase Integration**: Auth, users, domains, bans (optional for self-hosting) (optional for self-hosting)
+- ✅ **Self-hosted Mode**: Optional PostgreSQL-only operation without external dependencies
 - ✅ **HTTP Request Filtering**: Rejects HTTP requests to IMAP port
 - ✅ **Subdomain Support**: Create inboxes on parent and child domains
 - ✅ **Graceful Error Handling**: Detailed logging with tracing
@@ -112,8 +116,8 @@ This server is designed as a **secure IMAP retrieval server** that:
 ## 📋 Prerequisites
 
 - **Rust** 1.70+ (for compilation)
-- **PostgreSQL** 12+ (for email storage)
-- **Supabase Account** (for authentication and user management)
+- **PostgreSQL** 12+ (for email storage and optional self-hosted features)
+- - **Supabase Account** (optional, for authentication and advanced features)
 - **Linux/Windows/macOS** (any platform supporting Rust)
 - **Port 143 Access** (standard IMAP port, or use custom port)
 
@@ -160,9 +164,13 @@ Create a `.env` file in the project root with the following variables:
 # PostgreSQL Database (REQUIRED)
 DATABASE_URL=postgresql://admin:admin@localhost:5432/cybertemp
 
-# Supabase Configuration (REQUIRED)
+# Supabase Configuration (OPTIONAL - set to false for self-hosted)
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_KEY=your-service-role-key-here
+
+# Self-hosted toggles (OPTIONAL - default true for backward compatibility)
+USE_SUPABASE_BANS=true
+USE_SUPABASE_DOMAINS=true
 
 # IMAP Server Settings (OPTIONAL)
 IMAP_BIND=0.0.0.0:143                    # Default: 0.0.0.0:143
@@ -173,8 +181,10 @@ IMAP_BIND=0.0.0.0:143                    # Default: 0.0.0.0:143
 | Variable               | Required | Description                                        |
 | ---------------------- | -------- | -------------------------------------------------- |
 | `DATABASE_URL`         | ✅ Yes   | PostgreSQL connection string for retrieving emails |
-| `SUPABASE_URL`         | ✅ Yes   | Your Supabase project URL                          |
-| `SUPABASE_SERVICE_KEY` | ✅ Yes   | Supabase service role key (for admin operations)   |
+| `SUPABASE_URL`         | ❌ No    | Your Supabase project URL (optional)               |
+| `SUPABASE_SERVICE_KEY` | ❌ No    | Supabase service role key (optional)               |
+| `USE_SUPABASE_BANS`    | ❌ No    | Use Supabase for bans (default: true)              |
+| `USE_SUPABASE_DOMAINS` | ❌ No    | Use Supabase for domains (default: true)           |
 | `IMAP_BIND`            | ❌ No    | IMAP bind address (default: 0.0.0.0:143)           |
 
 ---
@@ -199,11 +209,30 @@ This creates:
   - `from_addr`, `to_addrs`
   - `timestamp`, `flags`, `size`
   - `created_at`
-- Indexes on `mailbox_owner`, `mailbox`, and `timestamp`
+- `inbox` table (for self-hosted inbox management):
+  - `id` (UUID primary key)
+  - `email_address` (TEXT, unique)
+  - `user_id` (UUID, nullable)
+  - `created_at` (TIMESTAMPTZ)
+- `domains` table (for self-hosted domain management):
+  - `id` (UUID primary key)
+  - `domain` (TEXT)
+  - `user_id` (UUID)
+  - `active` (BOOLEAN)
+  - `cloudflare_domain` (BOOLEAN)
+  - `created_at` (TIMESTAMPTZ)
+- `bans` table (for self-hosted ban management):
+  - `id` (UUID primary key)
+  - `scope` ('email', 'domain', 'sender')
+  - `value` (TEXT)
+  - `match_type` ('exact' or 'contains')
+  - `status` ('active' or 'inactive')
+  - `created_at` (TIMESTAMPTZ)
+- Indexes on `mailbox_owner`, `mailbox`, `timestamp`, and other tables
 
-### Supabase Tables
+### Supabase Tables (Optional)
 
-You need to create these tables in your Supabase project:
+If using Supabase for advanced features (`USE_SUPABASE_*=true`), create these tables in your Supabase project:
 
 #### 1. `imap_tokens` table (Authentication)
 
@@ -668,7 +697,7 @@ v0.1.0 ⋮ 11/01/2025
 + Domain validation with caching (60s refresh)
 + Ban system (email, domain, sender with exact/contains matching)
 + IMAP commands: LOGIN, LIST, SELECT, FETCH, SEARCH, STATUS
-+ Inbox management: CREATE, DELETE
++ Inbox management: CREATE/DELETE via IMAP
 + Multipart MIME parsing with text extraction
 + Quoted-printable decoding
 + Subdomain support for inbox creation
@@ -678,6 +707,7 @@ v0.1.0 ⋮ 11/01/2025
 + Real-time sender ban filtering in FETCH/SEARCH
 + Last used timestamp tracking for tokens
 + Graceful error handling and logging
++ Self-hosted mode support (optional PostgreSQL-only operation)
 ```
 
 ---
